@@ -146,6 +146,19 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
   font-weight: 600;
 }
 
+.results button.retract {
+  margin-left: auto;
+  padding: 2px 10px;
+  font-size: 0.78rem;
+  background: transparent;
+  color: var(--err);
+  border-color: var(--err);
+}
+
+.results li.retracted {
+  opacity: 0.5;
+}
+
 .results pre {
   margin: 0;
   white-space: pre-wrap;

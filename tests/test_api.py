@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+import sqlite3
 import threading
 import time
 
@@ -206,3 +207,118 @@ def test_restart_via_lifespan_keeps_old_index(tmp_path):
         fresh.shutdown()
         gate.set()
         manager.shutdown()
+
+
+def test_retract_over_http(server):
+    keep = server.client.post(
+        "/api/logs", json={"service": "auth-api", "body": "保留 keptmark"}
+    ).json()
+    wrong = server.client.post(
+        "/api/logs", json={"service": "auth-api", "body": "误录 wrongmark"}
+    ).json()
+    assert server.client.get("/api/logs", params={"q": "wrongmark"}).json()["total"] == 1
+    services = server.client.get("/api/services").json()["items"]
+    assert services == [{"service": "auth-api", "count": 2}]
+
+    response = server.client.delete(f"/api/logs/{wrong['id']}")
+    assert response.status_code == 200
+    assert response.json()["id"] == wrong["id"]
+    assert response.json()["deleted_at"]
+
+    found = server.client.get("/api/logs", params={"q": "wrongmark"}).json()
+    assert found["total"] == 0
+    assert found["items"] == []
+    assert server.client.get("/api/logs", params={"q": "keptmark"}).json()["total"] == 1
+    assert server.client.get(
+        "/api/logs", params={"service": "auth-api"}
+    ).json()["items"][0]["id"] == keep["id"]
+    assert server.client.get("/api/services").json()["items"] == [
+        {"service": "auth-api", "count": 1}
+    ]
+    assert server.client.get("/api/status").json()["total_logs"] == 1
+
+    # Repeating the retraction changes nothing.
+    again = server.client.delete(f"/api/logs/{wrong['id']}")
+    assert again.status_code == 200
+    assert again.json()["already_retracted"] is True
+    assert again.json()["deleted_at"] == response.json()["deleted_at"]
+    assert server.client.get("/api/services").json()["items"] == [
+        {"service": "auth-api", "count": 1}
+    ]
+
+    assert server.client.delete("/api/logs/999999").status_code == 404
+    assert server.client.delete("/api/logs/not-a-number").status_code == 422
+
+
+def test_retract_while_rebuild_over_http(server):
+    for i in range(30):
+        server.client.post("/api/logs", json={"service": "pay", "body": f"重建前 b{i}"})
+    victim = server.client.post(
+        "/api/logs", json={"service": "pay", "body": "将被撤回 duringmark"}
+    ).json()
+    old = server.client.get("/api/status").json()["active"]["id"]
+    held = threading.Event()
+    batches = []
+
+    def hook(event, payload):
+        if event == "batch":
+            batches.append(payload)
+            held.wait(10)
+
+    server.manager.build_hook = hook
+    assert server.client.post("/api/reindex").status_code == 202
+    deadline = time.monotonic() + 10
+    while not batches and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert batches, "builder never ran"
+
+    response = server.client.delete(f"/api/logs/{victim['id']}")
+    assert response.status_code == 200
+    # Ingestion and search remain available mid-build and mid-retraction.
+    fresh = server.client.post(
+        "/api/logs", json={"service": "pay", "body": "重建中写入 livemark"}
+    )
+    assert fresh.status_code == 201
+    mid = server.client.get("/api/logs", params={"q": "duringmark"}).json()
+    assert mid["total"] == 0
+    assert mid["generation"]["id"] == old
+    assert server.client.get("/api/status").json()["building"] is not None
+
+    held.set()
+    data = server.wait_active_changed(old)
+    assert data["building"] is None
+    # The rebuild still switched despite the retraction.
+    new_generation = data["active"]["id"]
+    for query, expected in [("b1", 11), ("livemark", 1), ("duringmark", 0)]:
+        result = server.client.get(
+            "/api/logs", params={"q": query, "limit": 200}
+        ).json()
+        assert result["total"] == expected, query
+        assert result["generation"]["id"] == new_generation
+    assert server.client.get("/api/status").json()["total_logs"] == 31
+
+
+def test_failed_retract_write_over_http_keeps_log(server):
+    log = server.client.post(
+        "/api/logs", json={"service": "db", "body": "撤回失败 faillog"}
+    ).json()
+    manager = server.manager
+
+    def failing_write_tx():
+        raise sqlite3.OperationalError("模拟磁盘故障")
+
+    manager._write_tx = failing_write_tx
+    try:
+        response = server.client.delete(f"/api/logs/{log['id']}")
+    finally:
+        del manager._write_tx
+    # The write transaction rolled back; the API reports the failure and the
+    # log stays visible.
+    assert response.status_code == 503
+    assert "原日志保留" in response.json()["detail"]
+    assert server.client.get("/api/logs", params={"q": "faillog"}).json()["total"] == 1
+    assert server.client.get("/api/services").json()["items"] == [
+        {"service": "db", "count": 1}
+    ]
+    assert server.client.delete(f"/api/logs/{log['id']}").status_code == 200
+    assert server.client.get("/api/logs", params={"q": "faillog"}).json()["total"] == 0

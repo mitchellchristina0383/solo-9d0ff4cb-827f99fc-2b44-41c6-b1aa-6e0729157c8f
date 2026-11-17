@@ -12,6 +12,7 @@ import pytest
 
 from app.indexer import (
     IndexManager,
+    LogNotFound,
     RebuildInProgress,
     document_tokens,
     fts_match_expression,
@@ -440,3 +441,351 @@ def test_rebuild_progress_is_monotonic(manager):
     wait_for(lambda: building(manager) is None)
     assert cursors == sorted(cursors)
     assert len(cursors) >= 2
+
+
+# ------------------------------------------------------------- retraction
+def test_retracted_log_disappears_from_search_and_services(manager):
+    keep = manager.add_log("auth", "登录成功 okmark")
+    gone = manager.add_log("auth", "误录日志 badmark")
+    assert manager.search("badmark", None)["total"] == 1
+    assert manager.services() == [{"service": "auth", "count": 2}]
+
+    retracted = manager.retract_log(gone["id"])
+    assert retracted["id"] == gone["id"]
+    assert retracted["already_retracted"] is False
+    assert retracted["deleted_at"]
+
+    assert manager.search("badmark", None)["total"] == 0
+    assert manager.search("okmark", None)["total"] == 1
+    by_service = manager.search(None, "auth")
+    assert by_service["total"] == 1
+    assert by_service["items"][0]["id"] == keep["id"]
+    assert manager.services() == [{"service": "auth", "count": 1}]
+    status = manager.status()
+    assert status["total_logs"] == 1
+    assert status["active"]["doc_count"] == 2  # FTS row kept for the invariant
+
+    # The log row itself is preserved, only marked.
+    conn = sqlite3.connect(manager.db_path)
+    try:
+        row = conn.execute(
+            "SELECT body, deleted_at FROM logs WHERE id = ?", (gone["id"],)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row[0] == "误录日志 badmark"
+    assert row[1] is not None
+
+
+def test_retraction_is_idempotent(manager):
+    log = manager.add_log("svc", "重复撤回 idem")
+    first = manager.retract_log(log["id"])
+    second = manager.retract_log(log["id"])
+    assert second["already_retracted"] is True
+    assert second["deleted_at"] == first["deleted_at"]
+    assert manager.search("idem", None)["total"] == 0
+    assert manager.search(None, "svc")["total"] == 0
+    assert manager.services() == []
+    assert manager.status()["total_logs"] == 0
+
+
+def test_retracting_unknown_log_raises(manager):
+    with pytest.raises(LogNotFound):
+        manager.retract_log(999)
+
+
+def test_retracted_log_not_returned_by_new_index(manager):
+    manager.add_log("svc", "保留 keepmark")
+    gone = manager.add_log("svc", "撤回 dropmark")
+    manager.retract_log(gone["id"])
+    old = active_id(manager)
+    manager.start_rebuild()
+    wait_for(lambda: active_id(manager) != old)
+
+    assert manager.search("dropmark", None)["total"] == 0
+    assert manager.search("keepmark", None)["total"] == 1
+    assert manager.search(None, "svc")["total"] == 1
+    # doc_count counts the physical FTS rows of the generation (the retracted
+    # row is kept there so activation bookkeeping does not race); the live
+    # count exposed to users is total_logs.
+    assert manager.status()["active"]["doc_count"] == 2
+    assert manager.status()["total_logs"] == 1
+
+
+def test_row_retracted_after_builder_read_it_still_completes_and_stays_hidden(manager):
+    """Builder read the row before the retraction; the rebuild still activates."""
+    for i in range(5):
+        manager.add_log("svc", f"批次日志 batch{i}")
+    marked = manager.add_log("svc", "将被撤回 latemark")
+    old = active_id(manager)
+    calls = {"n": 0}
+
+    def hook(event, payload):
+        if event == "batch":
+            calls["n"] += 1
+            # Fetching already happened for this batch; retract now so the
+            # tokens are inserted into the new table after the retraction.
+            manager.retract_log(marked["id"])
+
+    manager.build_hook = hook
+    manager.start_rebuild()
+    wait_for(lambda: active_id(manager) != old)
+    assert calls["n"] >= 1
+    new_active = manager.status()["active"]
+    # Retraction does not block activation: the build still switched.
+    assert new_active["status"] == "active"
+    assert manager.search("latemark", None)["total"] == 0
+    assert manager.search("batch", None)["total"] == 5
+    # The stale FTS row may be present, but the generation is complete for
+    # every live log and no retracted log is visible.
+    assert manager.search(None, "svc")["total"] == 5
+
+
+def test_row_retracted_during_batch_read_still_completes_rebuild(manager):
+    """Retraction between ``_fetch_batch`` and ``_index_batch`` must not abort activation."""
+    for i in range(3):
+        manager.add_log("svc", f"竞态 race{i}")
+    victim = manager.add_log("svc", "竞态 victimmark")
+    old = active_id(manager)
+    original_index_batch = manager._index_batch
+
+    def index_batch_then_retract(generation_id, rows):
+        original_index_batch(generation_id, rows)
+        # Simulates a request thread retracting a row this build just wrote;
+        # with an unqualified COUNT check this is where activation used to fail.
+        manager.retract_log(victim["id"])
+
+    manager._index_batch = index_batch_then_retract
+    try:
+        manager.start_rebuild()
+        wait_for(lambda: active_id(manager) != old)
+    finally:
+        manager._index_batch = original_index_batch
+    assert manager.search("victimmark", None)["total"] == 0
+    assert manager.search("race", None)["total"] == 3
+
+
+def test_failed_retraction_write_keeps_log_and_index(manager):
+    log = manager.add_log("svc", "写入失败 failmark")
+    manager.add_log("svc", "其他 othermark")
+    old = active_id(manager)
+    original_write_tx = manager._write_tx
+
+    def failing_write_tx():
+        raise sqlite3.OperationalError("磁盘已满")
+
+    manager._write_tx = failing_write_tx
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            manager.retract_log(log["id"])
+    finally:
+        manager._write_tx = original_write_tx
+
+    # Original log and active index are untouched and still searchable.
+    assert manager.search("failmark", None)["total"] == 1
+    assert manager.search("othermark", None)["total"] == 1
+    assert manager.search(None, "svc")["total"] == 2
+    assert manager.services() == [{"service": "svc", "count": 2}]
+    assert manager.status()["total_logs"] == 2
+    assert active_id(manager) == old
+    # A later retraction succeeds normally.
+    assert manager.retract_log(log["id"])["already_retracted"] is False
+    assert manager.search("failmark", None)["total"] == 0
+
+
+def test_retraction_rolls_back_if_the_update_fails(manager):
+    """A failing statement inside the transaction must not leave deleted_at set."""
+    log = manager.add_log("svc", "事务回滚 txmark")
+    with manager._write_tx() as conn:
+        conn.execute(
+            "CREATE TRIGGER block_retract BEFORE UPDATE OF deleted_at ON logs "
+            "BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+        )
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            manager.retract_log(log["id"])
+    finally:
+        with manager._write_tx() as conn:
+            conn.execute("DROP TRIGGER block_retract")
+    assert manager.search("txmark", None)["total"] == 1
+    assert manager.retract_log(log["id"])["already_retracted"] is False
+
+
+def test_doc_count_tracks_fts_rows_not_live_logs(manager):
+    log = manager.add_log("svc", "计数 countmark")
+    assert manager.status()["active"]["doc_count"] == 1
+    manager.retract_log(log["id"])
+    # doc_count counts physical index rows (needed for activation
+    # bookkeeping); total_logs is the user-facing live count.
+    assert manager.status()["active"]["doc_count"] == 1
+    assert manager.status()["total_logs"] == 0
+    manager.add_log("svc", "再计数 countmark2")
+    assert manager.status()["active"]["doc_count"] == 2
+    assert manager.status()["total_logs"] == 1
+
+
+def test_activation_rejects_index_missing_a_live_log(manager):
+    """The completeness check must still catch a genuinely broken build."""
+    manager.add_log("svc", "完整性 completeness")
+    old = active_id(manager)
+    original_index_batch = manager._index_batch
+
+    def index_batch_but_drop_row(generation_id, rows):
+        original_index_batch(generation_id, rows)
+        generation = manager._get_generation(generation_id)
+        with manager._write_tx() as conn:
+            conn.execute(
+                f'DELETE FROM "{generation["fts_table"]}" WHERE rowid = ?',
+                (rows[-1]["id"],),
+            )
+
+    manager._index_batch = index_batch_but_drop_row
+    try:
+        manager.start_rebuild()
+        wait_for(lambda: manager.status()["latest"]["status"] == "failed")
+    finally:
+        manager._index_batch = original_index_batch
+    assert active_id(manager) == old
+    assert "不完整" in manager.status()["latest"]["error"]
+    assert manager.search("completeness", None)["total"] == 1
+
+
+def test_inflight_search_sees_committed_state_once(manager):
+    manager.add_log("svc", "撤回前 snapshotmark")
+    during = threading.Event()
+    resume = threading.Event()
+    seen = {}
+
+    def search_hook(active):
+        if not during.is_set():
+            during.set()
+            # Pause after the search pinned its read snapshot; the retraction
+            # commits while it is paused.
+            resume.wait(5)
+
+    manager.search_hook = search_hook
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = pool.submit(manager.search, "snapshotmark", None)
+        assert during.wait(5)
+        assert manager.retract_log(1)["already_retracted"] is False
+        resume.set()
+        seen = pending.result(timeout=10)
+
+    # The search that started before the commit keeps the pre-commit view...
+    assert seen["total"] == 1
+    # ...and every search started afterwards sees the retraction.
+    assert manager.search("snapshotmark", None)["total"] == 0
+
+
+def test_retraction_while_build_frozen_lets_rebuild_activate(manager):
+    """Retraction must not be blocked by, nor block, a concurrent rebuild."""
+    for i in range(20):
+        manager.add_log("svc", f"并发重建 concurrent{i}")
+    victim = manager.add_log("svc", "并发重建 frozenmark")
+    old = active_id(manager)
+    reached = threading.Event()
+    release = threading.Event()
+
+    def hook(event, payload):
+        if event == "batch":
+            reached.set()
+            release.wait(10)
+
+    manager.build_hook = hook
+    manager.start_rebuild()
+    assert reached.wait(5)
+    assert manager.retract_log(victim["id"])["already_retracted"] is False
+    # Ingestion and search still work while the builder is paused.
+    manager.add_log("svc", "并发写入 duringbuild")
+    assert manager.search("duringbuild", None)["total"] == 1
+    release.set()
+    wait_for(lambda: active_id(manager) != old)
+    assert manager.search("frozenmark", None)["total"] == 0
+    assert manager.search(None, "svc")["total"] == 21
+
+
+def test_existing_database_is_migrated_for_retraction(tmp_path):
+    """A DB created before this feature has no deleted_at and no FTS rows for
+    a new column; opening it must add the column without touching the index."""
+    db = str(tmp_path / "old.db")
+    conn = sqlite3.connect(db)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service TEXT NOT NULL,
+                body TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE index_generations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                activated_at TEXT,
+                finished_at TEXT,
+                start_id INTEGER NOT NULL DEFAULT 0,
+                build_cursor INTEGER NOT NULL DEFAULT 0,
+                indexed_through INTEGER NOT NULL DEFAULT 0,
+                doc_count INTEGER NOT NULL DEFAULT 0,
+                fts_table TEXT NOT NULL,
+                error TEXT
+            );
+            CREATE VIRTUAL TABLE fts_0123456789abcdef USING fts5(tokens);
+            INSERT INTO logs(service, body, created_at)
+                VALUES ('old', '历史日志 legacy', '2026-01-01T00:00:00+00:00');
+            INSERT INTO fts_0123456789abcdef(rowid, tokens) VALUES (1, '历史 史日 日志 legacy');
+            INSERT INTO index_generations
+                (status, created_at, start_id, build_cursor, indexed_through,
+                 doc_count, fts_table)
+                VALUES ('active', '2026-01-01T00:00:00+00:00', 1, 1, 1, 1,
+                        'fts_0123456789abcdef');
+            """
+        )
+    finally:
+        conn.close()
+
+    idx = IndexManager(db)
+    idx.initialize()
+    try:
+        assert idx.search("legacy", None)["total"] == 1
+        assert idx.retract_log(1)["already_retracted"] is False
+        assert idx.search("legacy", None)["total"] == 0
+        assert idx.services() == []
+    finally:
+        idx.shutdown()
+
+    reopened = IndexManager(db)
+    reopened.initialize()
+    try:
+        assert reopened.search("legacy", None)["total"] == 0
+        assert reopened.retract_log(1)["already_retracted"] is True
+    finally:
+        reopened.shutdown()
+
+
+def test_retraction_after_restart_stays_hidden(manager):
+    log = manager.add_log("svc", "重启后 restartmark")
+    manager.retract_log(log["id"])
+    db = manager.db_path
+    manager.shutdown()
+
+    fresh = IndexManager(db)
+    fresh.initialize()
+    try:
+        assert fresh.search("restartmark", None)["total"] == 0
+        assert fresh.search(None, "svc")["total"] == 0
+        assert fresh.status()["total_logs"] == 0
+    finally:
+        fresh.shutdown()
+
+
+def test_retracted_log_is_not_counted_in_pagination(manager):
+    ids = [manager.add_log("svc", f"分页 page{i}")["id"] for i in range(6)]
+    manager.retract_log(ids[2])
+    first = manager.search("page", None, limit=2, offset=0)
+    second = manager.search("page", None, limit=2, offset=2)
+    third = manager.search("page", None, limit=2, offset=4)
+    got = [item["id"] for item in first["items"] + second["items"] + third["items"]]
+    assert got == sorted([i for i in ids if i != ids[2]], reverse=True)
+    assert first["total"] == 5 and third["total"] == 5

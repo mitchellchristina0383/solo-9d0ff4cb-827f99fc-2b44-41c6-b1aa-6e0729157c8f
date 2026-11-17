@@ -10,6 +10,15 @@ Writes and activation are serialized with ``BEGIN IMMEDIATE`` (and an
 in-process lock).  Readers pick one generation id and only ever query that
 generation's FTS table; retired tables are kept, so an in-flight search cannot
 observe a half-switched index.
+
+Retracting a mistakenly entered log is a logical deletion: ``logs.deleted_at``
+is set in one transaction, and every search/service count filters on it.  FTS
+rows are deliberately left in place.  A rebuild that fetched a row just before
+it was retracted therefore still indexes it, which is harmless because the
+search join filters on ``deleted_at``.  Activation verifies, in the same
+transaction as the switch, that every *live* log has an index row; it never
+compares raw row counts, so a retraction racing with the builder cannot block
+activation.
 """
 
 from __future__ import annotations
@@ -34,7 +43,8 @@ CREATE TABLE IF NOT EXISTS logs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     service     TEXT NOT NULL,
     body        TEXT NOT NULL,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    deleted_at  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_logs_service_id
@@ -69,6 +79,10 @@ class RebuildInProgress(RuntimeError):
 
 class IndexUnavailable(RuntimeError):
     """Raised when no active index exists."""
+
+
+class LogNotFound(LookupError):
+    """Raised when the requested log id does not exist."""
 
 
 class BuildAborted(RuntimeError):
@@ -184,6 +198,13 @@ class IndexManager:
             conn.execute("PRAGMA synchronous = NORMAL")
             try:
                 conn.executescript(_SCHEMA)
+                # Databases created by older versions have no deleted_at.
+                columns = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(logs)").fetchall()
+                }
+                if "deleted_at" not in columns:
+                    conn.execute("ALTER TABLE logs ADD COLUMN deleted_at TEXT")
             except sqlite3.OperationalError as exc:
                 if "fts5" in str(exc).lower():
                     raise RuntimeError(
@@ -388,7 +409,13 @@ class IndexManager:
             )
 
     def _fetch_batch(self, cursor: int, start_id: int) -> list[dict[str, Any]]:
-        """Rows from the generation's initial snapshot not indexed yet."""
+        """Rows from the generation's initial snapshot not indexed yet.
+
+        Retracted rows are deliberately included: indexing them costs a little
+        space but keeps the ``doc_count`` bookkeeping a pure count of rows
+        written to the table, so activation does not race with retractions.
+        Searches hide them by joining on ``deleted_at``.
+        """
         if cursor >= start_id:
             return []
         conn = self._connect()
@@ -442,14 +469,22 @@ class IndexManager:
                 raise BuildAborted("该重建已不是有效任务")
 
             table = generation["fts_table"]
-            total_logs = conn.execute("SELECT COUNT(*) FROM logs").fetchone()[0]
-            indexed = conn.execute(
-                f'SELECT COUNT(*) FROM "{table}"'
+            # Exact check: every live log must have a row in the new table.
+            # Retracted logs may still have one (they are hidden by the
+            # deleted_at join), but a live log without an index entry means
+            # the build is incomplete.  Running this inside the activation's
+            # BEGIN IMMEDIATE transaction means no add_log/retract can commit
+            # between this check and the switch, so a retraction that landed
+            # after the builder read the row cannot cause a false failure.
+            missing = conn.execute(
+                f'SELECT COUNT(*) FROM logs l WHERE l.deleted_at IS NULL '
+                f'AND NOT EXISTS (SELECT 1 FROM "{table}" WHERE rowid = l.id)'
             ).fetchone()[0]
-            if indexed != total_logs:
+            if missing:
                 raise RuntimeError(
-                    f"新索引不完整（已索引 {indexed} 条，日志共 {total_logs} 条），拒绝启用"
+                    f"新索引不完整（缺少 {missing} 条有效日志），拒绝启用"
                 )
+            indexed = int(generation["doc_count"])
             max_log_id = conn.execute(
                 "SELECT COALESCE(MAX(id), 0) FROM logs"
             ).fetchone()[0]
@@ -463,7 +498,7 @@ class IndexManager:
                 "SET status = 'active', activated_at = ?, finished_at = ?, "
                 "    indexed_through = ?, doc_count = ? "
                 "WHERE id = ? AND status = 'building'",
-                (utcnow(), utcnow(), max_log_id, total_logs, generation_id),
+                (utcnow(), utcnow(), max_log_id, indexed, generation_id),
             )
 
     def _fail_generation(self, generation_id: int, exc: BaseException) -> None:
@@ -520,6 +555,39 @@ class IndexManager:
             "service": service,
             "body": body,
             "created_at": created_at,
+        }
+
+    def retract_log(self, log_id: int) -> dict[str, Any]:
+        """Logically delete one log, atomically for every generation.
+
+        The ``logs`` row and its FTS entries are kept; ``deleted_at`` makes
+        every query ignore them from the moment this transaction commits.
+        Because a search pins one read snapshot, it sees the log either
+        entirely before or entirely after the retraction.  A rebuild that
+        already fetched the row keeps it in the new FTS table, which is
+        harmless (the search join filters on ``deleted_at``) and keeps the
+        index-completeness invariant independent of retraction timing.
+
+        Retracting an already retracted log is a no-op.
+        """
+        with self._write_tx() as conn:
+            cursor = conn.execute(
+                "UPDATE logs SET deleted_at = ? "
+                "WHERE id = ? AND deleted_at IS NULL",
+                (utcnow(), log_id),
+            )
+            changed = cursor.rowcount == 1
+            current = conn.execute(
+                "SELECT id, service, deleted_at FROM logs WHERE id = ?",
+                (log_id,),
+            ).fetchone()
+        if current is None:
+            raise LogNotFound(f"日志 #{log_id} 不存在")
+        return {
+            "id": current["id"],
+            "service": current["service"],
+            "deleted_at": current["deleted_at"],
+            "already_retracted": not changed,
         }
 
     # ---------------------------------------------------------------- search
@@ -581,7 +649,7 @@ class IndexManager:
             # accepted in the MATCH expression.
             where = (
                 f'FROM "{table}" JOIN logs l ON l.id = "{table}".rowid '
-                f'WHERE "{table}" MATCH ?'
+                f'WHERE "{table}" MATCH ? AND l.deleted_at IS NULL'
             )
             params: list[Any] = [match]
             if service:
@@ -601,13 +669,15 @@ class IndexManager:
             table = active["fts_table"]
             total = conn.execute(
                 f'SELECT COUNT(*) FROM "{table}" JOIN logs l '
-                f'ON l.id = "{table}".rowid WHERE l.service = ?',
+                f'ON l.id = "{table}".rowid '
+                f"WHERE l.service = ? AND l.deleted_at IS NULL",
                 (service,),
             ).fetchone()[0]
             rows = conn.execute(
                 f'SELECT l.id, l.service, l.body, l.created_at '
                 f'FROM "{table}" JOIN logs l ON l.id = "{table}".rowid '
-                f"WHERE l.service = ? ORDER BY l.id DESC LIMIT ? OFFSET ?",
+                f"WHERE l.service = ? AND l.deleted_at IS NULL "
+                f"ORDER BY l.id DESC LIMIT ? OFFSET ?",
                 (service, limit, offset),
             ).fetchall()
             mode = "service"
@@ -632,7 +702,9 @@ class IndexManager:
             latest = conn.execute(
                 "SELECT * FROM index_generations ORDER BY id DESC LIMIT 1"
             ).fetchone()
-            total_logs = conn.execute("SELECT COUNT(*) FROM logs").fetchone()[0]
+            total_logs = conn.execute(
+                "SELECT COUNT(*) FROM logs WHERE deleted_at IS NULL"
+            ).fetchone()[0]
         finally:
             conn.close()
 
@@ -662,6 +734,7 @@ class IndexManager:
         try:
             rows = conn.execute(
                 "SELECT service, COUNT(*) AS count FROM logs "
+                "WHERE deleted_at IS NULL "
                 "GROUP BY service ORDER BY service COLLATE NOCASE"
             ).fetchall()
             return [dict(row) for row in rows]

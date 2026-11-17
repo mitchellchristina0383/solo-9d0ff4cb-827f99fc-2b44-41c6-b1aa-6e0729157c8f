@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
@@ -13,7 +14,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from .indexer import IndexManager, IndexUnavailable, RebuildInProgress
+from .indexer import (
+    IndexManager,
+    IndexUnavailable,
+    LogNotFound,
+    RebuildInProgress,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -80,6 +86,20 @@ def create_app(db_path: str | None = None, *, manager: IndexManager | None = Non
     async def list_services():
         idx = get_manager()
         return {"items": await run_in_threadpool(idx.services)}
+
+    @app.delete("/api/logs/{log_id}")
+    async def retract_log(log_id: int):
+        idx = get_manager()
+        try:
+            return await run_in_threadpool(idx.retract_log, log_id)
+        except LogNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (sqlite3.Error, OSError) as exc:
+            # The write transaction rolled back: the log and the live index
+            # are still exactly as they were before this request.
+            raise HTTPException(
+                status_code=503, detail="撤回写入失败，原日志保留，请稍后重试"
+            ) from exc
 
     @app.post("/api/reindex", status_code=202)
     async def start_reindex():

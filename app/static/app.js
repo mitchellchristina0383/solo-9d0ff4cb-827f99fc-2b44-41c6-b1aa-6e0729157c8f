@@ -109,7 +109,13 @@ function renderResults(result, q, service) {
     time.textContent = fmtTime(item.created_at);
     const id = document.createElement("span");
     id.textContent = `#${item.id}`;
-    metaRow.append(svc, time, id);
+    const retract = document.createElement("button");
+    retract.type = "button";
+    retract.className = "retract";
+    retract.textContent = "撤回";
+    retract.title = `撤回日志 #${item.id}`;
+    retract.addEventListener("click", () => retractLog(item.id, retract));
+    metaRow.append(svc, time, id, retract);
     const pre = document.createElement("pre");
     pre.textContent = item.body;
     li.append(metaRow, pre);
@@ -120,6 +126,56 @@ function renderResults(result, q, service) {
     li.className = "hint";
     li.textContent = "没有匹配的日志。";
     list.appendChild(li);
+  }
+}
+
+let lastSearch = null;
+
+async function runSearch() {
+  const q = $("search-q").value.trim();
+  const service = $("search-service").value.trim();
+  const hint = $("search-meta");
+  if (!q && !service) {
+    hint.textContent = "请至少填写服务名或关键词。";
+    $("results").textContent = "";
+    lastSearch = null;
+    return;
+  }
+  const params = new URLSearchParams();
+  if (q) params.set("q", q);
+  if (service) params.set("service", service);
+  const result = await call("GET", `/api/logs?${params}`);
+  lastSearch = { q, service };
+  renderResults(result, q, service);
+  return result;
+}
+
+async function retractLog(logId, button) {
+  const confirmed = window.confirm(
+    `确定撤回日志 #${logId} 吗？撤回后检索结果、服务计数和之后的索引重建都不再包含它。`
+  );
+  if (!confirmed) return;
+  button.disabled = true;
+  try {
+    const data = await call("DELETE", `/api/logs/${logId}`);
+    button.closest("li").classList.add("retracted");
+    void loadServices();
+    void refreshStatus();
+    const message = data.already_retracted
+      ? `日志 #${logId} 此前已撤回，本次未做改动。`
+      : `已撤回日志 #${logId}。`;
+    $("search-meta").textContent = message;
+    if (lastSearch) {
+      try {
+        const refreshed = await runSearch();
+        $("search-meta").textContent = `${message} 当前命中 ${refreshed.total} 条。`;
+      } catch (error) {
+        $("search-meta").textContent = `${message} 但刷新结果失败：${error.message}`;
+      }
+    }
+  } catch (error) {
+    button.disabled = false;
+    $("search-meta").textContent = `撤回 #${logId} 失败：${error.message}`;
   }
 }
 
@@ -172,20 +228,15 @@ $("log-form").addEventListener("submit", async (event) => {
 
 $("search-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  const q = $("search-q").value.trim();
-  const service = $("search-service").value.trim();
   const hint = $("search-meta");
-  if (!q && !service) {
+  if (!$("search-q").value.trim() && !$("search-service").value.trim()) {
     hint.textContent = "请至少填写服务名或关键词。";
     $("results").textContent = "";
+    lastSearch = null;
     return;
   }
-  const params = new URLSearchParams();
-  if (q) params.set("q", q);
-  if (service) params.set("service", service);
   try {
-    const result = await call("GET", `/api/logs?${params}`);
-    renderResults(result, q, service);
+    await runSearch();
   } catch (error) {
     hint.textContent = `检索失败：${error.message}`;
     $("results").textContent = "";
