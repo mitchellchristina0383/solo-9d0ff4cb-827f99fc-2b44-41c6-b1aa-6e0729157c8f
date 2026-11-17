@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>日志检索值班台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>日志检索值班台</h1>
+    <div class="status" id="status-box" aria-live="polite">索引状态加载中…</div>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>录入日志</h2>
+      <form id="log-form">
+        <label>服务名
+          <input name="service" id="log-service" required maxlength="100" placeholder="例如 auth-api" autocomplete="off">
+        </label>
+        <label>日志正文
+          <textarea name="body" id="log-body" required maxlength="20000" rows="4" placeholder="粘贴故障日志…"></textarea>
+        </label>
+        <div class="row">
+          <button type="submit" id="submit-log">写入</button>
+          <span class="hint" id="log-hint"></span>
+        </div>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>检索</h2>
+      <form id="search-form">
+        <div class="search-grid">
+          <label>服务名
+            <input name="service" id="search-service" list="service-list" placeholder="全部服务" autocomplete="off">
+            <datalist id="service-list"></datalist>
+          </label>
+          <label>关键词
+            <input name="q" id="search-q" placeholder="例如 登录失败 timeout" autocomplete="off">
+          </label>
+          <button type="submit" id="search-button">检索</button>
+        </div>
+      </form>
+      <p class="hint" id="search-meta"></p>
+      <ol id="results" class="results"></ol>
+    </section>
+
+    <section class="card">
+      <h2>索引重建</h2>
+      <div class="row">
+        <button id="rebuild-button">发起重建</button>
+        <span class="hint" id="rebuild-hint">重建期间录入与检索保持可用。</span>
+      </div>
+      <dl class="details" id="index-details"></dl>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

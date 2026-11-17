@@ -1,0 +1,14 @@
+services:
+  logs:
+    build: .
+    image: log-search:local
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      LOGDB_PATH: /data/logs.db
+    volumes:
+      - logdata:/data
+    restart: unless-stopped
+
+volumes:
+  logdata:
